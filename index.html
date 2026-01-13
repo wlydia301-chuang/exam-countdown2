@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>自訂期末考看板系統</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <style>
+        /* 隱藏數字輸入框的箭頭 */
+        input[type=number]::-webkit-inner-spin-button, 
+        input[type=number]::-webkit-outer-spin-button { 
+            -webkit-appearance: none; 
+            margin: 0; 
+        }
+        
+        /* 自定義字體與全螢幕佈局 */
+        body {
+            font-family: "Microsoft JhengHei", "Heiti TC", sans-serif;
+            overflow: hidden; /* 防止滾動 */
+            background-color: #f3f4f6;
+        }
+
+        /* 隱藏檔案輸入原始按鈕 */
+        .hidden-input {
+            display: none;
+        }
+
+        /* 讓按鈕在被點擊時有明顯回饋 */
+        .btn-active:active {
+            transform: scale(0.95);
+        }
+
+        /* 跑道進度條動畫 */
+        .track-transition {
+            transition: stroke-dashoffset 1s linear, stroke 0.5s ease;
+        }
+
+        /* 隱藏捲軸但保留功能 */
+        .no-scrollbar::-webkit-scrollbar {
+            display: none;
+        }
+        .no-scrollbar {
+            -ms-overflow-style: none;  /* IE and Edge */
+            scrollbar-width: none;  /* Firefox */
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useMemo, useRef } = React;
+
+        // 預設的考程表範本 (第一次開啟時使用)
+        const DEFAULT_SCHEDULE = [
+            { id: 1, type: 'break', start: '08:35', end: '08:40', subject: '準備' },
+            { id: 2, type: 'exam',  start: '08:40', end: '09:20', subject: '國語' },
+            { id: 3, type: 'break', start: '09:20', end: '09:30', subject: '下課' },
+            { id: 4, type: 'exam',  start: '09:30', end: '10:10', subject: '自然' },
+            { id: 5, type: 'break', start: '10:10', end: '10:25', subject: '下課' },
+            { id: 6, type: 'exam',  start: '10:25', end: '11:05', subject: '英文' },
+        ];
+
+        // 格式化時間 HH:MM:SS
+        const formatTime = (date) => {
+            const h = String(date.getHours()).padStart(2, '0');
+            const m = String(date.getMinutes()).padStart(2, '0');
+            const s = String(date.getSeconds()).padStart(2, '0');
+            return `${h}:${m}:${s}`;
+        };
+
+        const App = () => {
+            // --- 狀態管理 ---
+            
+            // 1. 系統時間與偏移量
+            const [now, setNow] = useState(new Date());
+            const [offset, setOffset] = useState(() => {
+                const saved = localStorage.getItem('exam_clock_offset');
+                return saved ? parseInt(saved, 10) : 0;
+            });
+
+            // 2. 考程表 (Schedule) - 可新增/刪除/修改
+            const [schedule, setSchedule] = useState(() => {
+                const saved = localStorage.getItem('exam_schedule_v2');
+                return saved ? JSON.parse(saved) : DEFAULT_SCHEDULE;
+            });
+
+            // 3. 班級資料 (應到/實到/未到/抽離)
+            const [classData, setClassData] = useState(() => {
+                const saved = localStorage.getItem('exam_class_data_v2');
+                return saved ? JSON.parse(saved) : {
+                    shouldArrive: "",
+                    actualArrive: "",
+                    absentList: "",    // 未到
+                    withdrawnList: ""  // 抽離 (新增)
+                };
+            });
+
+            // 4. 提醒事項 (Reminders) - 純文字
+            const [reminderText, setReminderText] = useState(() => {
+                return localStorage.getItem('exam_reminder_text') || "1. 考卷寫上班級姓名座號\n2. 寫完多檢查\n3. 考試結束前不可交卷";
+            });
+
+            // 5. 音檔相關 (使用 Map 以 ID 對應，避免刪除列時錯亂)
+            // 結構: { [scheduleId]: { src, fileName, isPlaying, progress } }
+            const [audioTracks, setAudioTracks] = useState({});
+            
+            // Refs
+            const audioRefs = useRef({});
+            const fileInputRefs = useRef({});
+
+            // --- Effect: 時鐘滴答 ---
+            useEffect(() => {
+                const timer = setInterval(() => {
+                    setNow(new Date());
+                }, 1000);
+                return () => clearInterval(timer);
+            }, []);
+
+            // --- Effect: 自動存檔 ---
+            useEffect(() => { localStorage.setItem('exam_clock_offset', offset); }, [offset]);
+            useEffect(() => { localStorage.setItem('exam_schedule_v2', JSON.stringify(schedule)); }, [schedule]);
+            useEffect(() => { localStorage.setItem('exam_class_data_v2', JSON.stringify(classData)); }, [classData]);
+            useEffect(() => { localStorage.setItem('exam_reminder_text', reminderText); }, [reminderText]);
+
+            // --- 計算邏輯 ---
+            
+            // 修正後的時間
+            const adjustedNow = useMemo(() => new Date(now.getTime() + offset), [now, offset]);
+
+            // 判斷當前時段 (基於動態的 schedule)
+            const currentSlot = useMemo(() => {
+                const currentMs = adjustedNow.getHours() * 3600000 + adjustedNow.getMinutes() * 60000 + adjustedNow.getSeconds() * 1000;
+                
+                for (let slot of schedule) {
+                    const [sh, sm] = slot.start.split(':').map(Number);
+                    const startMs = sh * 3600000 + sm * 60000;
+                    
+                    const [eh, em] = slot.end.split(':').map(Number);
+                    const endMs = eh * 3600000 + em * 60000;
+
+                    if (currentMs >= startMs && currentMs < endMs) {
+                        return { ...slot, startMs, endMs, durationMs: endMs - startMs };
+                    }
+                }
+                return null;
+            }, [adjustedNow, schedule]);
+
+            // 進度條邏輯
+            const progressInfo = useMemo(() => {
+                if (!currentSlot) {
+                    return { remainingPercent: 0, color: 'stroke-gray-300', text: '等待下一節' };
+                }
+
+                const currentMs = adjustedNow.getHours() * 3600000 + adjustedNow.getMinutes() * 60000 + adjustedNow.getSeconds() * 1000;
+                const progressMs = currentMs - currentSlot.startMs;
+                const totalMs = currentSlot.durationMs;
+                const remainingMs = totalMs - progressMs;
+                
+                const elapsedPercent = Math.min(100, Math.max(0, (progressMs / totalMs) * 100));
+                const remainingPercent = 100 - elapsedPercent;
+
+                let colorClass = 'stroke-green-500';
+                let statusText = "";
+
+                if (currentSlot.type === 'exam') {
+                    statusText = "考試進行中";
+                    if (remainingMs <= totalMs / 2) {
+                        colorClass = 'stroke-yellow-400';
+                        statusText = "時間剩一半";
+                    }
+                    if (remainingMs <= 10 * 60000) {
+                        colorClass = 'stroke-red-500';
+                        statusText = "最後10分鐘";
+                    }
+                } else {
+                    // 休息時間
+                    if (remainingMs > 5 * 60000) {
+                        colorClass = 'stroke-green-500';
+                        statusText = "下課休息";
+                    } else if (remainingMs > 2 * 60000) {
+                        colorClass = 'stroke-yellow-400';
+                        statusText = "準備回座";
+                    } else {
+                        colorClass = 'stroke-red-500';
+                        statusText = "準備考試";
+                    }
+                }
+
+                return { remainingPercent, color: colorClass, text: statusText };
+            }, [adjustedNow, currentSlot]);
+
+
+            // --- 操作函式 ---
+
+            // 修改班級資料
+            const handleClassDataChange = (field, value) => {
+                setClassData(prev => ({ ...prev, [field]: value }));
+            };
+
+            // 修改考程表單一欄位
+            const handleScheduleChange = (index, field, value) => {
+                const newSchedule = [...schedule];
+                newSchedule[index][field] = value;
+                setSchedule(newSchedule);
+            };
+
+            // 新增考程
+            const addScheduleItem = () => {
+                setSchedule(prev => [
+                    ...prev, 
+                    { id: Date.now(), type: 'exam', start: '00:00', end: '00:00', subject: '' }
+                ]);
+            };
+
+            // 刪除考程
+            const removeScheduleItem = (index) => {
+                if(confirm("確定刪除此時段？")) {
+                    setSchedule(prev => prev.filter((_, i) => i !== index));
+                }
+            };
+
+            // 切換 考試/休息
+            const toggleScheduleType = (index) => {
+                const newSchedule = [...schedule];
+                newSchedule[index].type = newSchedule[index].type === 'exam' ? 'break' : 'exam';
+                setSchedule(newSchedule);
+            };
+
+            // 時間微調
+            const adjustTime = (seconds) => {
+                setOffset(prev => prev + (seconds * 1000));
+            };
+
+            // --- 音檔邏輯 (複雜部分：需對應 ID) ---
+            const handleFileSelect = (id, e) => {
+                const file = e.target.files[0];
+                if (file) {
+                    const url = URL.createObjectURL(file);
+                    setAudioTracks(prev => ({
+                        ...prev,
+                        [id]: { src: url, fileName: file.name, isPlaying: false, progress: 0 }
+                    }));
+                }
+            };
+
+            const togglePlay = (id) => {
+                const audioEl = audioRefs.current[id];
+                if (!audioEl) return;
+
+                const isPlaying = audioTracks[id]?.isPlaying;
+
+                setAudioTracks(prev => {
+                    const next = { ...prev };
+                    // 暫停其他
+                    Object.keys(next).forEach(key => {
+                        if (key !== String(id) && next[key]?.isPlaying) {
+                            if (audioRefs.current[key]) audioRefs.current[key].pause();
+                            next[key] = { ...next[key], isPlaying: false };
+                        }
+                    });
+                    
+                    if (!isPlaying) {
+                        audioEl.play();
+                        next[id] = { ...next[id], isPlaying: true };
+                    } else {
+                        audioEl.pause();
+                        next[id] = { ...next[id], isPlaying: false };
+                    }
+                    return next;
+                });
+            };
+
+            const replayAudio = (id) => {
+                const audioEl = audioRefs.current[id];
+                if (!audioEl) return;
+                audioEl.currentTime = 0;
+                audioEl.play();
+                setAudioTracks(prev => ({
+                    ...prev,
+                    [id]: { ...prev[id], isPlaying: true }
+                }));
+            };
+
+            const handleAudioUpdate = (id, e) => {
+                const current = e.target.currentTime;
+                const duration = e.target.duration;
+                const percent = (duration > 0) ? (current / duration) * 100 : 0;
+                setAudioTracks(prev => ({
+                    ...prev,
+                    [id]: { ...prev[id], progress: percent }
+                }));
+                if (e.type === 'ended') {
+                    setAudioTracks(prev => ({
+                        ...prev,
+                        [id]: { ...prev[id], isPlaying: false, progress: 0 }
+                    }));
+                }
+            };
+
+            return (
+                <div className="flex flex-col h-screen w-screen overflow-hidden text-gray-800">
+                    
+                    {/* === C區 (上方 1/3): 系統時間與進度條 === */}
+                    <div className="h-[33vh] w-full bg-white border-b-4 border-gray-300 flex flex-row relative shadow-lg z-10">
+                        {/* 左側: 時間 */}
+                        <div className="w-1/3 flex flex-col items-center justify-center border-r border-gray-200 bg-gray-50 relative group px-2">
+                            <div className="text-[1.5vw] text-gray-500 font-bold mb-1 tracking-widest">現在時間</div>
+                            <div className="text-[6vw] font-black leading-none text-gray-800 tabular-nums tracking-tighter mb-2">
+                                {formatTime(adjustedNow)}
+                            </div>
+                            {/* 微調按鈕 (滑鼠移過去顯示) */}
+                            <div className="grid grid-cols-2 gap-x-4 gap-y-1 opacity-10 group-hover:opacity-100 transition-opacity w-full max-w-[240px]">
+                                <div className="flex justify-between gap-1">
+                                    <button onClick={() => adjustTime(-60)} className="btn-active flex-1 py-1 bg-gray-200 rounded text-xs">-1分</button>
+                                    <button onClick={() => adjustTime(60)} className="btn-active flex-1 py-1 bg-gray-200 rounded text-xs">+1分</button>
+                                </div>
+                                <div className="flex justify-between gap-1">
+                                    <button onClick={() => adjustTime(-1)} className="btn-active flex-1 py-1 bg-gray-200 rounded text-xs">-1秒</button>
+                                    <button onClick={() => adjustTime(1)} className="btn-active flex-1 py-1 bg-gray-200 rounded text-xs">+1秒</button>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* 右側: 進度條 */}
+                        <div className="w-2/3 flex flex-col relative bg-gray-100 items-center justify-center p-4">
+                            <div className="absolute inset-0 flex items-center justify-center z-10">
+                                <span className="text-[4vw] font-bold text-gray-500 opacity-60 select-none whitespace-nowrap drop-shadow-sm">
+                                    {progressInfo.text}
+                                </span>
+                            </div>
+                            <svg className="w-full h-full" viewBox="0 0 300 50" preserveAspectRatio="xMidYMid meet">
+                                <rect x="5" y="5" width="290" height="40" rx="20" ry="20" fill="none" stroke="#e5e7eb" strokeWidth="8" />
+                                <rect x="5" y="5" width="290" height="40" rx="20" ry="20" fill="none" 
+                                    className={`track-transition ${progressInfo.color}`} strokeWidth="8" pathLength="100" strokeDasharray="100"
+                                    strokeDashoffset={100 - progressInfo.remainingPercent} strokeLinecap="round" />
+                            </svg>
+                        </div>
+                    </div>
+
+                    {/* === 下方區塊容器 (A + B) === */}
+                    <div className="flex-1 flex flex-row h-[67vh]">
+                        
+                        {/* === A區 (左側 1/2): 考程表與點名 === */}
+                        <div className="w-1/2 flex flex-col border-r-4 border-gray-300 bg-white overflow-hidden">
+                            
+                            {/* A1: 考程表 (可編輯列表) */}
+                            <div className="h-2/3 flex flex-col border-b-2 border-dashed border-gray-300 overflow-y-auto no-scrollbar relative">
+                                {schedule.map((slot, index) => {
+                                    const isActive = currentSlot && currentSlot.id === slot.id;
+                                    const audio = audioTracks[slot.id] || {};
+
+                                    return (
+                                        <div key={slot.id} className={`flex items-center gap-1 border-b border-gray-100 p-2 transition-colors duration-300 ${isActive ? 'bg-yellow-200' : 'hover:bg-gray-50'}`}>
+                                            {/* 類型切換 (考試/休息) */}
+                                            <button onClick={() => toggleScheduleType(index)} 
+                                                className={`text-xs px-2 py-1 rounded font-bold w-12 flex-shrink-0 ${slot.type === 'exam' ? 'bg-red-100 text-red-600' : 'bg-green-100 text-green-600'}`}>
+                                                {slot.type === 'exam' ? '考試' : '休息'}
+                                            </button>
+
+                                            {/* 時間輸入 (修正：加大寬度與字體) */}
+                                            <div className="flex flex-col w-32 flex-shrink-0">
+                                                <input type="text" value={slot.start} onChange={(e) => handleScheduleChange(index, 'start', e.target.value)}
+                                                    className="w-full text-center text-2xl font-bold text-gray-700 bg-transparent outline-none focus:text-blue-600" />
+                                                <div className="h-px bg-gray-300 w-full my-0.5"></div>
+                                                <input type="text" value={slot.end} onChange={(e) => handleScheduleChange(index, 'end', e.target.value)}
+                                                    className="w-full text-center text-2xl font-bold text-gray-700 bg-transparent outline-none focus:text-blue-600" />
+                                            </div>
+
+                                            {/* 科目輸入 (修正：加大字體) */}
+                                            <input type="text" value={slot.subject} onChange={(e) => handleScheduleChange(index, 'subject', e.target.value)}
+                                                className="flex-1 text-[2.5vw] font-black bg-transparent outline-none placeholder-gray-300 text-black min-w-0" 
+                                                placeholder="科目" />
+
+                                            {/* 音檔與刪除區 */}
+                                            <div className="flex items-center gap-1">
+                                                {/* 隱藏的檔案輸入 */}
+                                                <input type="file" accept="audio/*" ref={el => fileInputRefs.current[slot.id] = el}
+                                                    onChange={(e) => handleFileSelect(slot.id, e)} className="hidden-input" />
+                                                
+                                                <button onClick={() => fileInputRefs.current[slot.id].click()} className="btn-active p-1 text-gray-400 hover:text-blue-500" title="上傳聽力">
+                                                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                                                </button>
+
+                                                {audio.src && (
+                                                    <>
+                                                        <button onClick={() => togglePlay(slot.id)} className={`btn-active px-2 py-0.5 text-xs rounded text-white ${audio.isPlaying ? 'bg-red-500' : 'bg-green-500'}`}>
+                                                            {audio.isPlaying ? 'II' : 'Play'}
+                                                        </button>
+                                                        <button onClick={() => replayAudio(slot.id)} className="btn-active p-1 text-blue-500">
+                                                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                                                        </button>
+                                                        <audio ref={el => audioRefs.current[slot.id] = el} src={audio.src} hidden 
+                                                            onTimeUpdate={(e) => handleAudioUpdate(slot.id, e)} onEnded={(e) => handleAudioUpdate(slot.id, e)} />
+                                                    </>
+                                                )}
+
+                                                <button onClick={() => removeScheduleItem(index)} className="btn-active p-1 text-gray-300 hover:text-red-500">
+                                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                                                </button>
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                                {/* 新增按鈕 */}
+                                <button onClick={addScheduleItem} className="w-full py-2 text-center text-gray-400 hover:bg-gray-100 hover:text-blue-500 font-bold border-t border-dashed">
+                                    + 新增時段
+                                </button>
+                            </div>
+
+                            {/* A2: 出席人數與名單 (下方 1/3) */}
+                            <div className="h-1/3 flex flex-row bg-blue-50">
+                                {/* 應到/實到 */}
+                                <div className="w-1/5 flex flex-col">
+                                    <div className="flex-1 flex flex-col items-center justify-center border-r border-b border-blue-200">
+                                        {/* 修正：字體統一加大為 text-xl */}
+                                        <span className="text-xl font-bold text-blue-800">應到</span>
+                                        <input type="number" value={classData.shouldArrive} onChange={(e) => handleClassDataChange('shouldArrive', e.target.value)}
+                                            className="w-full text-center bg-transparent text-2xl font-bold text-blue-900 outline-none" placeholder="0" />
+                                    </div>
+                                    <div className="flex-1 flex flex-col items-center justify-center border-r border-blue-200">
+                                        {/* 修正：字體統一加大為 text-xl */}
+                                        <span className="text-xl font-bold text-green-800">實到</span>
+                                        <input type="number" value={classData.actualArrive} onChange={(e) => handleClassDataChange('actualArrive', e.target.value)}
+                                            className="w-full text-center bg-transparent text-2xl font-bold text-green-900 outline-none" placeholder="0" />
+                                    </div>
+                                </div>
+                                
+                                {/* 未到名單 (左) */}
+                                <div className="flex-1 flex flex-col items-center justify-center p-1 border-r border-blue-200">
+                                    {/* 修正：字體統一加大為 text-xl */}
+                                    <span className="text-xl font-bold text-red-800">未到座號</span>
+                                    <textarea value={classData.absentList} onChange={(e) => handleClassDataChange('absentList', e.target.value)}
+                                        className="w-full h-full text-center bg-transparent text-[1.5vw] font-bold text-red-600 outline-none resize-none leading-tight placeholder-red-200"
+                                        placeholder="輸入未到..." />
+                                </div>
+
+                                {/* 抽離名單 (右 - 新增) */}
+                                <div className="flex-1 flex flex-col items-center justify-center p-1 bg-orange-50">
+                                    {/* 修正：字體統一加大為 text-xl */}
+                                    <span className="text-xl font-bold text-orange-800">抽離座號</span>
+                                    <textarea value={classData.withdrawnList} onChange={(e) => handleClassDataChange('withdrawnList', e.target.value)}
+                                        className="w-full h-full text-center bg-transparent text-[1.5vw] font-bold text-orange-600 outline-none resize-none leading-tight placeholder-orange-200"
+                                        placeholder="輸入抽離..." />
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* === B區 (右側 1/2): 提醒事項白板 === */}
+                        <div className="w-1/2 bg-[#fffdf0] flex flex-col relative">
+                            <div className="absolute top-0 left-0 bg-yellow-400 text-yellow-900 px-4 py-2 text-xl font-bold rounded-br-lg z-20 pointer-events-none">
+                                提醒事項
+                            </div>
+                            <textarea 
+                                value={reminderText}
+                                onChange={(e) => setReminderText(e.target.value)}
+                                className="w-full h-full bg-transparent p-12 pt-16 text-[3.5vw] font-bold text-gray-800 outline-none resize-none leading-snug placeholder-gray-300 text-center"
+                                placeholder="點擊此處輸入提醒事項..."
+                            />
+                            {/* 裝飾線條 */}
+                            <div className="h-4 bg-stripes w-full"></div>
+                        </div>
+                    </div>
+                    
+                    <style>{`
+                        .bg-stripes {
+                            background-image: linear-gradient(45deg, #fbbf24 25%, transparent 25%, transparent 50%, #fbbf24 50%, #fbbf24 75%, transparent 75%, transparent);
+                            background-size: 20px 20px;
+                        }
+                    `}</style>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
